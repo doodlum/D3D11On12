@@ -98,6 +98,7 @@ void Internal::LRUCache::TrimUnusedAllocationsSinceLastNotificationPeriod(UINT64
     }
 }
 
+#ifdef __ID3D12Device15_INTERFACE_DEFINED__
 void APIENTRY ResidencyManager::PeriodicTrimNotificationCallback(const D3D12_TRIM_NOTIFICATION* pData)
 {
     ResidencyManager* pResidencyManager = reinterpret_cast<ResidencyManager*>(pData->pContext);
@@ -167,14 +168,17 @@ void APIENTRY ResidencyManager::PeriodicTrimNotificationCallback(const D3D12_TRI
         pResidencyManager->EvictionList.clear();
     }
 }
+#endif
 
 ResidencyManager::~ResidencyManager()
 {
+#ifdef __ID3D12Device15_INTERFACE_DEFINED__
     if (PeriodicTrimCallbackCookie != c_PeriodicTrimCallbackCookie_Unregistered)
     {
         [[maybe_unused]] HRESULT hr = Device15->UnregisterTrimNotificationCallback(PeriodicTrimCallbackCookie);
         assert(SUCCEEDED(hr));
     }
+#endif
 }
 
 HRESULT ResidencyManager::Initialize(UINT DeviceNodeIndex, IDXCoreAdapter *ParentAdapterDXCore, IDXGIAdapter3 *ParentAdapterDXGI)
@@ -199,6 +203,7 @@ HRESULT ResidencyManager::Initialize(UINT DeviceNodeIndex, IDXCoreAdapter *Paren
     HRESULT hr = S_OK;
     hr = AsyncThreadFence.Initialize(Device);
 
+#ifdef __ID3D12Device15_INTERFACE_DEFINED__
     // Register for Trim Notification Callback if supported by the OS
     // or ignore the failure and just not do periodic trims on OS that don't support it.
     if (SUCCEEDED(Device->QueryInterface(&Device15)))
@@ -209,6 +214,7 @@ HRESULT ResidencyManager::Initialize(UINT DeviceNodeIndex, IDXCoreAdapter *Paren
             PeriodicTrimCallbackCookie = registerArgs.CallbackCookie;
         }
     }
+#endif
 
     return hr;
 }

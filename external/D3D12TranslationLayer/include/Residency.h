@@ -339,9 +339,11 @@ namespace D3D12TranslationLayer
         const UINT64 PeriodicTrimNotificationIndexInitialValue = 1;
         UINT64 PeriodicTrimNotificationIndex = PeriodicTrimNotificationIndexInitialValue;
         // Cookie returned at trim notification callback registration. UINT32_MAX indicates no callback registered.
+#ifdef __ID3D12Device15_INTERFACE_DEFINED__
         const DWORD c_PeriodicTrimCallbackCookie_Unregistered = UINT32_MAX;
         DWORD PeriodicTrimCallbackCookie = c_PeriodicTrimCallbackCookie_Unregistered;
         static void APIENTRY PeriodicTrimNotificationCallback(const D3D12_TRIM_NOTIFICATION* pData);
+#endif
 
         void BeginTrackingObject(ManagedObject* pObject)
         {
@@ -450,7 +452,9 @@ namespace D3D12TranslationLayer
         Internal::Fence AsyncThreadFence;
 
         CComPtr<ID3D12Device3> Device;
+#ifdef __ID3D12Device15_INTERFACE_DEFINED__
         CComPtr<ID3D12Device15> Device15;
+#endif
         // NOTE: This is an index not a mask. The majority of D3D12 uses bit masks to identify a GPU node whereas DXGI uses 0 based indices.
         UINT NodeIndex = 0;
         IDXCoreAdapter* AdapterDXCore = nullptr;
