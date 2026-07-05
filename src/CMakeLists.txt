@@ -16,12 +16,10 @@ if (CMAKE_VERSION VERSION_GREATER 3.16)
 endif()
 
 set(USE_PIX OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    d3d12translationlayer
-    GIT_REPOSITORY https://github.com/microsoft/D3D12TranslationLayer.git
-    GIT_TAG        master
-)
-FetchContent_MakeAvailable(d3d12translationlayer)
+# Vendored (external/D3D12TranslationLayer) instead of FetchContent: the host project
+# controls dependency targets (DirectX-Headers guard lives in its CMakeLists).
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../external/D3D12TranslationLayer d3d12translationlayer)
+set(d3d12translationlayer_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../external/D3D12TranslationLayer)
 
 target_link_libraries(d3d11on12 d3d12translationlayer_wdk Microsoft::DirectX-Headers)
 target_include_directories(d3d11on12
