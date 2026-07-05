@@ -1171,7 +1171,7 @@ void CShaderAsm::EmitInstruction(const CInstruction& instruction)
 //*****************************************************************************
 BOOL CInstruction::Disassemble( __out_ecount(StringSize) LPSTR pString, UINT StringSize)
 {
-    StringCchCopy(pString, StringSize, g_InstructionInfo[m_OpCode].m_Name);
+    StringCchCopyA(pString, StringSize, g_InstructionInfo[m_OpCode].m_Name);
     return TRUE;
 }
 
