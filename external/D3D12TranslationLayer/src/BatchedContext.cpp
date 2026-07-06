@@ -649,10 +649,10 @@ BatchedContext::BatchedContext(ImmediateContext& ImmCtx, CreationArgs args, Call
 {
     if (args.SubmitBatchesToWorkerThread)
     {
-        m_BatchSubmittedSemaphore.m_h = CreateSemaphore(nullptr, 0, c_MaxOutstandingBatches, nullptr);
+        m_BatchSubmittedSemaphore.m_h = CreateSemaphore(nullptr, 0, c_MaxOutstandingBatchesInclPresent, nullptr);
         ThrowIfHandleNull(m_BatchSubmittedSemaphore);
 
-        m_BatchConsumedSemaphore.m_h = CreateSemaphore(nullptr, 0, c_MaxOutstandingBatches, nullptr);
+        m_BatchConsumedSemaphore.m_h = CreateSemaphore(nullptr, 0, c_MaxOutstandingBatchesInclPresent, nullptr);
         ThrowIfHandleNull(m_BatchConsumedSemaphore);
 
         m_BatchThread.m_h = CreateThread(
@@ -1355,6 +1355,10 @@ bool BatchedContext::SyncWithBatch(uint64_t& BatchID, bool DoNotFlush, TFunc&& G
                 // Submit and request flush to GPU as soon as it's done.
                 SubmitBatch(true);
             }
+            else if (cs_SubmitStatsEnabled())
+            {
+                InterlockedIncrement(&g_cs_eventSpinsThisFrame); // [CS perf] app-thread DoNotFlush spin
+            }
             // Theoretically we could avoid this, as the query might actually finish in the time
             // between here and the checks below, but this fails the conformance tests, so we'll
             // play it safe and just assume that can't happen.
@@ -1381,6 +1385,10 @@ bool BatchedContext::SyncWithBatch(uint64_t& BatchID, bool DoNotFlush, TFunc&& G
 
             // We don't know what command list types to use on this timeline, so just request all.
             (*iter)->m_FlushRequestedMask |= COMMAND_LIST_TYPE_ALL_MASK;
+        }
+        else if (cs_SubmitStatsEnabled())
+        {
+            InterlockedIncrement(&g_cs_eventSpinsThisFrame); // [CS perf] app-thread DoNotFlush spin
         }
         return false;
     }
@@ -1780,7 +1788,7 @@ std::unique_ptr<BatchedContext::Batch> BatchedContext::FinishBatch(bool bFlushIm
     // Synchronize with threads recording to the batch
     {
         auto Lock = m_RecordingLock.TakeLock();
-        if (m_CurrentBatch.empty() && m_PostBatchFunctions.empty())
+        if (m_CurrentBatch.empty() && m_PostBatchFunctions.empty() && !bFlushImmCtxAfterBatch)
         {
             return nullptr;
         }
@@ -1847,7 +1855,7 @@ void TRANSLATION_API BatchedContext::RetireBatch(std::unique_ptr<Batch> pBatch)
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
-bool TRANSLATION_API BatchedContext::SubmitBatch(bool bFlushImmCtxAfterBatch)
+bool TRANSLATION_API BatchedContext::SubmitBatch(bool bFlushImmCtxAfterBatch, bool bBlockOnBackPressure)
 {
     assert(!IsBatchThread());
     assert(m_CreationArgs.pParentContext == nullptr);
@@ -1871,20 +1879,29 @@ bool TRANSLATION_API BatchedContext::SubmitBatch(bool bFlushImmCtxAfterBatch)
     {
         auto Lock = m_RecordingLock.TakeLock();
 
-        // Check if there's room in the semaphores.
-        assert(m_NumOutstandingBatches <= c_MaxOutstandingBatches);
-        if (m_NumOutstandingBatches == c_MaxOutstandingBatches)
+        // Check if there's room in the semaphores. RENDER submits (bBlockOnBackPressure=true) throttle
+        // the app at c_MaxOutstandingBatches, outside any present/Steam-overlay CS. The present submit
+        // passes bBlockOnBackPressure=false so Present1 never blocks on the worker while holding the
+        // overlay CS (the AB/BA deadlock); it adds at most the reserved slot since a present is always
+        // preceded by ReleaseResource's blocking submit that caps outstanding at c_MaxOutstandingBatches.
+        assert(m_NumOutstandingBatches <= c_MaxOutstandingBatchesInclPresent);
+        if (bBlockOnBackPressure)
         {
-            WaitForSingleBatch(INFINITE);
-            assert(m_NumOutstandingBatches < c_MaxOutstandingBatches);
+            while (m_NumOutstandingBatches >= c_MaxOutstandingBatches)
+                WaitForSingleBatch(INFINITE);
         }
 
-        // Wake up the batch thread
+        // Wake up the batch thread. On the non-blocking path only increment on a successful release so
+        // a violated invariant degrades to a dropped wake (latency) rather than a lost-wakeup hang.
         BOOL value = ReleaseSemaphore(m_BatchSubmittedSemaphore, 1, nullptr);
-        assert(value == TRUE);
-        UNREFERENCED_PARAMETER(value);
-
-        ++m_NumOutstandingBatches;
+        if (value == TRUE)
+        {
+            ++m_NumOutstandingBatches;
+        }
+        else
+        {
+            assert(!bBlockOnBackPressure && "SubmitBatch semaphore overflow with back-pressure enabled");
+        }
     }
     return true;
 }

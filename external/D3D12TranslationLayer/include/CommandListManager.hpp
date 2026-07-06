@@ -20,6 +20,9 @@ namespace D3D12TranslationLayer
         void DispatchCommandAdded() noexcept;
         void UploadHeapSpaceAllocated(UINT64 heapSize) noexcept;
         void ReadbackInitiated() noexcept;
+        // [CS perf] True if the currently-open command list has recorded GPU work worth submitting.
+        // Guards the proactive submit-on-EVENT-End path so back-to-back Ends don't submit empty lists.
+        bool HasRecordedWork() const noexcept { return (m_NumDraws + m_NumDispatches + m_NumCommands) > 0; }
         void SubmitCommandListIfNeeded();
 
         void SetNeedSubmitFence() noexcept { m_bNeedSubmitFence = true; }

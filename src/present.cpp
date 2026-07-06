@@ -15,6 +15,71 @@ namespace D3D11On12
 
         assert(pArgs->pDirtyRects == nullptr && pArgs->DirtyRects == 0);
 
+        // [CS perf] BOUNDED ASYNC PRESENT (env CS_D3D11ON12_ASYNC_BOUNDED). Present on the worker
+        // thread so the app records the NEXT frame while the worker translates+presents this one
+        // (the overlap the full-drain destroys -> 44fps). But bound the APP thread to N frames ahead
+        // of the GPU via the present-fence frame-latency helper, so Skyrim's 3-deep dynamic upload-
+        // buffer ring stays valid (its EVENT fences are always <=N frames old) WITHOUT the full-drain
+        // serialisation. The worker's CloseAndSubmitGraphicsCommandListForPresent records each present
+        // fence, so this app-thread wait genuinely bounds frame production. The present's SubmitBatch
+        // is non-blocking + a reserved semaphore slot, so Present1 never blocks the app on the worker
+        // while holding the Steam-overlay CS (the AB/BA deadlock).
+        if (D3D12TranslationLayer::cs_AsyncBounded())
+        {
+            // [CS perf] Step-trace the first presents to a crash-surviving log so we can pinpoint
+            // where bounded-async dies (env CS_D3D11ON12_SUBMIT_STATS gates it; first ~12 presents).
+            static volatile LONG s_baLogCount = 0;
+            const bool baLog = D3D12TranslationLayer::cs_SubmitStatsEnabled() && InterlockedIncrement(&s_baLogCount) <= 12;
+            auto baTrace = [baLog](const char* msg) {
+                if (!baLog) return;
+                FILE* f = nullptr;
+                if (fopen_s(&f, "F:\\claudetmp\\ba_trace.log", "a") == 0 && f) { fprintf(f, "%s\n", msg); fclose(f); }
+            };
+            baTrace("BA enter");
+            auto& immCtx = pDevice->GetImmediateContextNoFlush();
+
+            // [CS perf] App-side frame-latency bound (replaces the MaxFrameLatencyHelper, whose ring
+            // is not populated on the async present path -> the wait no-ops -> the app runs unbounded
+            // -> Skyrim's 3-deep upload ring starves -> spin/hang). Record the GRAPHICS list id THIS
+            // present submits into an app-thread-only ring, then block until the GPU has completed the
+            // list from N presents ago: bounds the app to N presents ahead of the GPU (ring stays
+            // valid) WITHOUT the full-drain serialisation. The target is always an older, already-
+            // submitted list id (present K submitted it N frames ago), so WaitForFenceValue only
+            // waits, never submits; ring writes are app-thread-only; the fence read is a benign
+            // stale-read at worst.
+            static UINT64 s_baFenceRing[16] = {};
+            static volatile LONG s_baIdx = -1;
+            const UINT baN = D3D12TranslationLayer::cs_MaxLatency();
+            const LONG baIdx = InterlockedIncrement(&s_baIdx);
+            s_baFenceRing[baIdx & 15] = immCtx.GetCommandListID(D3D12TranslationLayer::COMMAND_LIST_TYPE::GRAPHICS);
+            if ((UINT)baIdx >= baN)
+            {
+                const UINT64 baTarget = s_baFenceRing[(baIdx - (LONG)baN) & 15];
+                // RAW fence wait: touch ONLY the GRAPHICS ID3D12Fence (GetCompletedValue +
+                // SetEventOnCompletion are pure fence ops, thread-safe), never immCtx mutable state
+                // that the worker owns -- WaitForFenceValue could submit/mutate and race the worker's
+                // PreDraw. Auto-reset event is app-thread-only (Present1), created once.
+                auto* pBaFence = immCtx.GetFence(D3D12TranslationLayer::COMMAND_LIST_TYPE::GRAPHICS);
+                if (pBaFence && pBaFence->GetCompletedValue() < baTarget)
+                {
+                    baTrace("BA waiting fence");
+                    static HANDLE s_baEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    if (s_baEvent && SUCCEEDED(pBaFence->SetEventOnCompletion(baTarget, s_baEvent)))
+                    {
+                        WaitForSingleObject(s_baEvent, INFINITE);
+                    }
+                }
+            }
+            baTrace("BA bounded");
+
+            auto& batchedContext = pDevice->GetBatchedContext();
+            batchedContext.EmplaceBatchExtension<PresentExtensionData>(&pDevice->m_PresentExt, pArgs);
+            baTrace("BA emplaced");
+            batchedContext.SubmitBatch(/*bFlushImmCtxAfterBatch*/ false, /*bBlockOnBackPressure*/ false);
+            baTrace("BA submitted");
+        }
+        else
+        {
         // Drain all queued RENDER translation on the worker thread. This preserves
         // render-before-present ordering AND guarantees the worker is idle (not touching the
         // ImmediateContext), so the present can be driven inline on this app thread. Same
@@ -38,6 +103,7 @@ namespace D3D11On12
         DXGIDDICB_PRESENT CBArgs = {};
         CBArgs.pDXGIContext = pPresentData->pDXGIContext;
         ThrowFailure((*pDevice->m_pDXGICallbacks->pfnPresentCb)(pDevice->m_hRTDevice.handle, &CBArgs));
+        }
 
         D3D11on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
     }

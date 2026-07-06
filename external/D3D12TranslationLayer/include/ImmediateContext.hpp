@@ -7,6 +7,21 @@ namespace D3D12TranslationLayer
 class Resource;
 class CommandListManager;
 
+// [CS perf] Granular-submit instrumentation + optimisation for Skyrim's upload-ring EVENT fences.
+// Counters are snapshot per-frame in ImmediateContext::Flush; env gates are read once, lazily.
+// See CommandListManager.cpp (submit counter), Query.cpp (event-spin counter + submit-on-End).
+extern volatile LONG g_cs_submitsThisFrame;
+extern volatile LONG g_cs_eventSpinsThisFrame;
+extern volatile LONG g_cs_eventEndsThisFrame;   // Async::End reached with an EVENT query
+extern volatile LONG g_cs_eventCondThisFrame;   // submit-on-EVENT guard passed
+extern volatile LONG g_cs_eventFiredThisFrame;  // SubmitCommandList actually ran
+bool cs_SubmitStatsEnabled() noexcept;
+bool cs_SubmitOnEventEnd() noexcept;
+bool cs_GranularSubmit() noexcept;
+bool cs_AsyncBounded() noexcept;   // bounded async present (overlap, GPU capped to N frames behind)
+UINT cs_MaxLatency() noexcept;     // frame-latency cap for bounded async (default 2)
+bool cs_NoOpportunistic() noexcept; // disable opportunistic mid-frame flush (cut over-submission)
+
 struct TranslationLayerCallbacks
 {
     std::function<void()> m_pfnPostSubmit;

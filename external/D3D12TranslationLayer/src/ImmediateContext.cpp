@@ -1147,6 +1147,32 @@ void ImmediateContext::AddObjectToResidencySet(Resource *pResource, COMMAND_LIST
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
+// [CS perf] Granular-submit instrumentation + optimisation globals (declared in ImmediateContext.hpp).
+volatile LONG g_cs_submitsThisFrame = 0;
+volatile LONG g_cs_eventSpinsThisFrame = 0;
+volatile LONG g_cs_eventEndsThisFrame = 0;
+volatile LONG g_cs_eventCondThisFrame = 0;
+volatile LONG g_cs_eventFiredThisFrame = 0;
+static bool cs_ReadEnvFlag(const char* name) noexcept
+{
+    char b[8] = {};
+    return GetEnvironmentVariableA(name, b, sizeof(b)) != 0 && b[0] == '1';
+}
+bool cs_SubmitStatsEnabled() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SUBMIT_STATS"); return v; }
+bool cs_SubmitOnEventEnd() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SUBMIT_ON_EVENT"); return v; }
+bool cs_GranularSubmit() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_GRANULAR_SUBMIT"); return v; }
+bool cs_AsyncBounded() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_ASYNC_BOUNDED"); return v; }
+bool cs_NoOpportunistic() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_NO_OPP"); return v; }
+UINT cs_MaxLatency() noexcept
+{
+    static const UINT v = [] {
+        char b[8] = {};
+        UINT n = (GetEnvironmentVariableA("CS_D3D11ON12_MAXLATENCY", b, sizeof(b)) != 0) ? (UINT)atoi(b) : 0;
+        return (n >= 1 && n <= 8) ? n : 2u; // default 2
+    }();
+    return v;
+}
+
 bool TRANSLATION_API ImmediateContext::Flush(UINT commandListTypeMask)
 {
 #ifdef USE_PIX
@@ -1167,6 +1193,33 @@ bool TRANSLATION_API ImmediateContext::Flush(UINT commandListTypeMask)
     // Even if there are no commands, the app could have still done things like delete resources,
     // these are expected to be cleaned up on a per-flush basis
     PostSubmitNotification();
+
+    // [CS perf] Snapshot submit/event-spin counters per graphics flush (~1/frame at present) and
+    // append a 120-frame average to a log so the granular-submit hypothesis can be validated:
+    // baseline predicts ~1 submit/frame + a high spin count; the fix should raise submits and
+    // collapse spins. Env-gated (off by default).
+    if (cs_SubmitStatsEnabled() && (commandListTypeMask & (1u << (UINT)COMMAND_LIST_TYPE::GRAPHICS)))
+    {
+        static LONG s_frames = 0, s_submitAccum = 0, s_spinAccum = 0, s_endsAccum = 0, s_condAccum = 0, s_firedAccum = 0;
+        s_submitAccum += InterlockedExchange(&g_cs_submitsThisFrame, 0);
+        s_spinAccum += InterlockedExchange(&g_cs_eventSpinsThisFrame, 0);
+        s_endsAccum += InterlockedExchange(&g_cs_eventEndsThisFrame, 0);
+        s_condAccum += InterlockedExchange(&g_cs_eventCondThisFrame, 0);
+        s_firedAccum += InterlockedExchange(&g_cs_eventFiredThisFrame, 0);
+        if (++s_frames >= 120)
+        {
+            FILE* f = nullptr;
+            if (fopen_s(&f, "F:\\claudetmp\\submitstats.log", "a") == 0 && f)
+            {
+                fprintf(f, "submitOnEvent=%d submits/f=%.2f spins/f=%.2f evEnds/f=%.2f evCond/f=%.2f evFired/f=%.2f (%ld frames)\n",
+                    cs_SubmitOnEventEnd() ? 1 : 0,
+                    (double)s_submitAccum / s_frames, (double)s_spinAccum / s_frames,
+                    (double)s_endsAccum / s_frames, (double)s_condAccum / s_frames, (double)s_firedAccum / s_frames, s_frames);
+                fclose(f);
+            }
+            s_frames = 0; s_submitAccum = 0; s_spinAccum = 0; s_endsAccum = 0; s_condAccum = 0; s_firedAccum = 0;
+        }
+    }
     return bSubmitCommandList;
 }
 

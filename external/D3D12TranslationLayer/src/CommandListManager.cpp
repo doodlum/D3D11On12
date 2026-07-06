@@ -90,6 +90,15 @@ namespace D3D12TranslationLayer
 
     void CommandListManager::SubmitCommandListIfNeeded()
     {
+        // [CS perf] Skyrim's steady-state render thread is worker-bound: it blocks on batch
+        // back-pressure while the worker drowns in ~11 opportunistic mid-frame submits/frame, each
+        // re-emitting ALL pipeline state (PrepareNewCommandList). Disabling the opportunistic flush
+        // (submit only at present) cuts that worker cost. Env-gated for A/B measurement.
+        if (cs_NoOpportunistic())
+        {
+            return;
+        }
+
         // TODO: Heuristics below haven't been heavily profiled, we'll likely want to re-visit and tune
         // this based on multiple factors when profiling (i.e. number of draws, amount of memory 
         // referenced, etc.), possibly changing on an app-by-app basis
@@ -97,25 +106,40 @@ namespace D3D12TranslationLayer
         // These parameters attempt to avoid regressing already CPU bound applications. 
         // In these cases, submitting too frequently will make the app slower due
         // to frequently re-emitting state and the overhead of submitting/creating command lists
-        static const UINT cMinDrawsOrDispatchesForSubmit = 512;
-        static const UINT cMinRenderOpsForSubmit = 1000;
+        // [CS perf] Under granular-submit, lower the thresholds so upload-heavy frames submit
+        // several times/frame (DXVK-like cadence) instead of once at present.
+        const bool bGranular = cs_GranularSubmit();
+        const UINT cMinDrawsOrDispatchesForSubmit = bGranular ? 128 : 512;
+        const UINT cMinRenderOpsForSubmit = bGranular ? 256 : 1000;
 
         // To further avoid regressing CPU bound applications, we'll stop opportunistic
         // flushing if it appears that the app doesn't need to kick off work early.
         static const UINT cMinFlushesWithNoCPUReadback = 50;
 
-        const bool bHaveEnoughCommandsForSubmit = 
+        const bool bHaveEnoughCommandsForSubmit =
             m_NumCommands > cMinRenderOpsForSubmit ||
             m_NumDraws + m_NumDispatches > cMinDrawsOrDispatchesForSubmit;
-        const bool bShouldOpportunisticFlush =
+        // [CS perf] The no-readback latch disabled opportunistic flush after 50 frames for Skyrim
+        // (its EVENT-fence readback didn't reset it), leaving present the ONLY submit. Keep it live
+        // under granular-submit.
+        const bool bShouldOpportunisticFlush = bGranular ||
             m_NumFlushesWithNoReadback < cMinFlushesWithNoCPUReadback;
         const bool bShouldFreeUpMemory =
             m_UploadHeapSpaceAllocated > m_MaxAllocatedUploadHeapSpacePerCommandList;
         if ((bHaveEnoughCommandsForSubmit && bShouldOpportunisticFlush) ||
             bShouldFreeUpMemory)
         {
-            // If the GPU is idle, submit work to keep it busy
-            if (m_Fence.GetCompletedValue() == m_commandListID - 1)
+            // [CS perf] THE structural fix. The original gate submitted ONLY when the GPU was
+            // already idle (GetCompletedValue == m_commandListID - 1) -- i.e. never during a busy
+            // frame, exactly when mid-frame pipelining is needed, so Skyrim's upload-ring EVENT
+            // fences could not signal until present (the 44fps/41%-GPU latency stall). Under
+            // granular-submit, also submit while the GPU is BUSY as long as we are not running too
+            // far ahead (< 2 command lists outstanding), so fences signal mid-frame without
+            // unbounded submission.
+            const UINT64 completed = m_Fence.GetCompletedValue();
+            const bool bGpuIdle = (completed == m_commandListID - 1);
+            const UINT64 outstanding = (m_commandListID - 1) - completed; // submitted, not yet done
+            if (bGpuIdle || (bGranular && outstanding < 2))
             {
                 if (g_hTracelogging)
                 {
@@ -222,6 +246,8 @@ namespace D3D12TranslationLayer
     //----------------------------------------------------------------------------------------------------------------------------------
     void CommandListManager::SubmitCommandListImpl() // throws
     {
+        if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_submitsThisFrame);
+
         // Walk through the list of active queries
         // and notify them that the command list is being submitted
         for (LIST_ENTRY *pListEntry = m_pParent->m_ActiveQueryList.Flink; pListEntry != &m_pParent->m_ActiveQueryList; pListEntry = pListEntry->Flink)

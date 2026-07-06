@@ -93,6 +93,32 @@ namespace D3D12TranslationLayer
                 m_EndedCommandListID[listType] = m_pParent->GetCommandListIDWithCommands((COMMAND_LIST_TYPE)listType);
             }
         }
+
+        // [CS perf] Skyrim uses EVENT queries as explicit GPU fences for its 3-deep dynamic
+        // upload-buffer ring; this recording-side End() is the app's "put this slot's work on the
+        // GPU now" request. Submit the list CONTAINING this EVENT proactively (via the CLM, not the
+        // ImmediateContext wrapper which can throw mid-batch-replay) so this fence's own list is on
+        // the GPU -- unlike a generic mid-frame submit, this does not advance the ring's list-ID
+        // timing, it just readies the EVENT the render thread is about to poll. Diagnostic counters
+        // (env-gated) split the guard so we can see exactly where it stops firing.
+        if (m_Type == e_QUERY_EVENT && cs_SubmitStatsEnabled())
+        {
+            InterlockedIncrement(&g_cs_eventEndsThisFrame);
+        }
+        const bool bEventSubmitCond = cs_SubmitOnEventEnd() && m_Type == e_QUERY_EVENT &&
+            (m_CommandListTypeMask & (1u << (UINT)COMMAND_LIST_TYPE::GRAPHICS)) &&
+            m_pParent->GetCommandListManager(COMMAND_LIST_TYPE::GRAPHICS)->HasRecordedWork();
+        if (bEventSubmitCond)
+        {
+            if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_eventCondThisFrame);
+            try
+            {
+                m_pParent->GetCommandListManager(COMMAND_LIST_TYPE::GRAPHICS)->SubmitCommandList();
+                if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_eventFiredThisFrame);
+            }
+            catch (_com_error&) {}
+            catch (std::bad_alloc&) {}
+        }
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
@@ -130,6 +156,13 @@ namespace D3D12TranslationLayer
                 {
                     if (DoNotFlush)
                     {
+                        // [CS perf] Count DO_NOT_FLUSH not-ready peeks on EVENT queries -- the
+                        // BSGraphics upload-ring Sleep(1) spin. Baseline predicts a high per-frame
+                        // count; the submit-on-EVENT-End fix should collapse it toward zero.
+                        if (cs_SubmitStatsEnabled() && m_Type == e_QUERY_EVENT)
+                        {
+                            InterlockedIncrement(&g_cs_eventSpinsThisFrame);
+                        }
                         return false;
                     }
                     

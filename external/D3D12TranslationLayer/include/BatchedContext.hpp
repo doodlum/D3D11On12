@@ -51,7 +51,8 @@ public:
     };
     using BatchPrimitive = UINT64;
     using BatchStorage = segmented_stack<BatchPrimitive, BatchSizeInBytes / sizeof(BatchPrimitive), BatchStorageAllocator>;
-    static constexpr UINT c_MaxOutstandingBatches = 5;
+    static constexpr UINT c_MaxOutstandingBatches = 5;                                     // RENDER back-pressure cap
+    static constexpr UINT c_MaxOutstandingBatchesInclPresent = c_MaxOutstandingBatches + 1; // + reserved present slot = semaphore capacity
 
     class Batch
     {
@@ -524,7 +525,7 @@ public:
     ~BatchedContext();
 
     bool TRANSLATION_API ProcessBatch();
-    bool TRANSLATION_API SubmitBatch(bool bFlushImmCtxAfterBatch = false);
+    bool TRANSLATION_API SubmitBatch(bool bFlushImmCtxAfterBatch = false, bool bBlockOnBackPressure = true);
     void TRANSLATION_API SubmitBatchIfIdle(bool bSkipFrequencyCheck = false);
 
     std::unique_ptr<Batch> TRANSLATION_API FinishBatch(bool bFlushImmCtxAfterBatch = false);
