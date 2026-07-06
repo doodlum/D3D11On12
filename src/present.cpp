@@ -15,6 +15,25 @@ namespace D3D11On12
 
         assert(pArgs->pDirtyRects == nullptr && pArgs->DirtyRects == 0);
 
+        // [CS perf] STEP-1d: measure the RENDER thread's CPU cycles per frame (Present1 runs once/frame on
+        // the render thread). If cycles/frame ~ CPU_freq*22ms -> CPU-bound in the DDI/record/runtime; if
+        // it's a small fraction -> the render thread is BLOCKED on an un-timed wait. Resolves the conflict
+        // between the (fast) layer timers, the (attach-biased) cdb, and the (low) VTune CPU reading.
+        if (D3D12TranslationLayer::cs_SubmitStatsEnabled())
+        {
+            static thread_local ULONG64 s_lastCycles = 0;
+            static thread_local LARGE_INTEGER s_lastWall = {};
+            ULONG64 nowCycles = 0; QueryThreadCycleTime(GetCurrentThread(), &nowCycles);
+            LARGE_INTEGER nowWall; QueryPerformanceCounter(&nowWall);
+            if (s_lastCycles && s_lastWall.QuadPart)
+            {
+                InterlockedAdd64(&D3D12TranslationLayer::g_cs_renderCycles, (LONG64)(nowCycles - s_lastCycles));
+                InterlockedAdd64(&D3D12TranslationLayer::g_cs_frameWallTicks, nowWall.QuadPart - s_lastWall.QuadPart);
+                InterlockedIncrement(&D3D12TranslationLayer::g_cs_frameCount);
+            }
+            s_lastCycles = nowCycles; s_lastWall = nowWall;
+        }
+
         // [CS perf] BOUNDED ASYNC PRESENT (env CS_D3D11ON12_ASYNC_BOUNDED). Present on the worker
         // thread so the app records the NEXT frame while the worker translates+presents this one
         // (the overlap the full-drain destroys -> 44fps). But bound the APP thread to N frames ahead
@@ -102,7 +121,11 @@ namespace D3D11On12
         pDevice->m_pPresentArgs = pPresentData;
         DXGIDDICB_PRESENT CBArgs = {};
         CBArgs.pDXGIContext = pPresentData->pDXGIContext;
+        // [CS perf] STEP-1c: time the actual present callback (swapchain flip / present queue).
+        const bool _csStats = D3D12TranslationLayer::cs_SubmitStatsEnabled();
+        LARGE_INTEGER _csA{}; if (_csStats) QueryPerformanceCounter(&_csA);
         ThrowFailure((*pDevice->m_pDXGICallbacks->pfnPresentCb)(pDevice->m_hRTDevice.handle, &CBArgs));
+        if (_csStats) { LARGE_INTEGER _csB{}; QueryPerformanceCounter(&_csB); InterlockedAdd64(&D3D12TranslationLayer::g_cs_presentTicks, _csB.QuadPart - _csA.QuadPart); }
         }
 
         D3D11on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
@@ -386,9 +409,14 @@ namespace D3D11On12
             D3D12TranslationLayer::Resource* pSrc = resource->ImmediateResource();
             auto pSwapChain = m_SwapChainManager->GetSwapChainForWindow(pKMTPresent->hWindow, *pSrc);
             auto swapChainHelper = D3D12TranslationLayer::SwapChainHelper(pSwapChain);
+            // [CS perf] STEP-1c: split the present into the frame-latency fence wait vs the swapchain present.
+            const bool _csStats = D3D12TranslationLayer::cs_SubmitStatsEnabled();
+            LARGE_INTEGER _csL0{}; if (_csStats) QueryPerformanceCounter(&_csL0);
             immCtx.m_MaxFrameLatencyHelper.WaitForMaximumFrameLatency();
+            LARGE_INTEGER _csL1{}; if (_csStats) { QueryPerformanceCounter(&_csL1); InterlockedAdd64(&D3D12TranslationLayer::g_cs_latencyWaitTicks, _csL1.QuadPart - _csL0.QuadPart); }
 
             hr = swapChainHelper.StandardPresent(immCtx, pKMTPresent, *pSrc);
+            if (_csStats) { LARGE_INTEGER _csP{}; QueryPerformanceCounter(&_csP); InterlockedAdd64(&D3D12TranslationLayer::g_cs_presentTicks, _csP.QuadPart - _csL1.QuadPart); }
         }
         
         D3D11on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);

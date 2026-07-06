@@ -33,7 +33,20 @@ namespace D3D11On12
 
         Query* pQuery = Query::CastFrom(hQuery);
 
+        // [CS perf] STEP-1e: time + count the render thread's QueryGetData calls. Skyrim's BSGraphics
+        // upload-ring polls an EVENT query with GetData + Sleep before reusing a ring slot; if the query's
+        // GPU work is submitted late, GetData returns S_FALSE (not-ready) repeatedly and the render thread
+        // spins — burning CPU (renderMcyc) while the frame stalls. High calls/f + notReady/f + getDataMs/f
+        // confirms this is the 3.6x wall.
+        const bool _csStats = D3D12TranslationLayer::cs_SubmitStatsEnabled();
+        LARGE_INTEGER _csA{}; if (_csStats) QueryPerformanceCounter(&_csA);
         HRESULT hr = SynchronizedResultToHRESULT(pDevice->GetBatchedContext().QueryGetData(&pQuery->m_Underlying, pData, DataSize, GetDataFlags & D3D10_DDI_GET_DATA_DO_NOT_FLUSH));
+        if (_csStats) {
+            LARGE_INTEGER _csB{}; QueryPerformanceCounter(&_csB);
+            InterlockedAdd64(&D3D12TranslationLayer::g_cs_getDataTicks, _csB.QuadPart - _csA.QuadPart);
+            InterlockedIncrement(&D3D12TranslationLayer::g_cs_getDataCalls);
+            if (hr == S_FALSE) InterlockedIncrement(&D3D12TranslationLayer::g_cs_getDataNotReady);
+        }
         D3D11on12_DDI_ENTRYPOINT_END_AND_REPORT_HR(hDevice, hr);
     }
 

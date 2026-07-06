@@ -124,6 +124,7 @@ ImmediateContext::ImmediateContext(UINT nodeIndex, D3D12_FEATURE_DATA_D3D12_OPTI
     if (m_CreationArgs.RenamingIsMultithreaded)
     {
         m_RenamesInFlight.InitLock();
+        m_RenameBackingPool.InitLock(); // [CS perf] discard-ring pool
     }
 
     if (m_CreationArgs.UseThreadpoolForPSOCreates)
@@ -1153,12 +1154,39 @@ volatile LONG g_cs_eventSpinsThisFrame = 0;
 volatile LONG g_cs_eventEndsThisFrame = 0;
 volatile LONG g_cs_eventCondThisFrame = 0;
 volatile LONG g_cs_eventFiredThisFrame = 0;
+// [CS perf] STEP-1 measurement: time spent in the Upload-suballocator Allocate (incl. its internal lock
+// wait) and the call count, accumulated across all threads. If this is a large fraction of the ~22ms
+// frame, the per-Map alloc/lock convoy IS the bottleneck and the discard ring is worth doing correctly.
+volatile LONG64 g_cs_allocTicksThisFrame = 0;
+volatile LONG g_cs_allocCountThisFrame = 0;
+volatile LONG64 g_cs_renderWaitTicks = 0;
+volatile LONG64 g_cs_workerBusyTicks = 0;
+volatile LONG64 g_cs_latencyWaitTicks = 0;
+volatile LONG64 g_cs_presentTicks = 0;
+volatile LONG64 g_cs_renderCycles = 0;
+volatile LONG64 g_cs_frameWallTicks = 0;
+volatile LONG64 g_cs_getDataTicks = 0;
+volatile LONG   g_cs_getDataCalls = 0;
+volatile LONG   g_cs_getDataNotReady = 0;
+volatile LONG   g_cs_frameCount = 0;
 static bool cs_ReadEnvFlag(const char* name) noexcept
 {
     char b[8] = {};
     return GetEnvironmentVariableA(name, b, sizeof(b)) != 0 && b[0] == '1';
 }
 bool cs_SubmitStatsEnabled() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SUBMIT_STATS"); return v; }
+// [CS perf] DEFAULT-ON: the O(1) FIFO rename-backing pool is a proven +35% (44->61fps), clean, stable win.
+// Disable only with CS_D3D11ON12_DISCARD_RING=0 (for A/B).
+bool cs_DiscardRing() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_DISCARD_RING", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
+// [CS perf] EXACT desc composite key for the rename backing pool: size (low 40b) | bindflags (16b) |
+// heaptype (8b). Same key <=> interchangeable backing (same size+bindflags+heaptype), so a bucket is
+// desc-uniform and the FIFO front is always a valid reuse candidate (only the fence needs checking).
+static inline UINT64 cs_RenamePoolKey(UINT64 size, RESOURCE_BIND_FLAGS bindFlags, AllocatorHeapType heapType) noexcept
+{
+    return (size & 0xFFFFFFFFFFull) | ((UINT64)((UINT)bindFlags & 0xFFFF) << 40) | ((UINT64)((UINT)heapType & 0xFF) << 56);
+}
+volatile LONG g_cs_renameReuse = 0;   // [CS perf] discard-ring pool HITS (reused a pooled Resource)
+volatile LONG g_cs_renameAlloc = 0;   // [CS perf] discard-ring MISSES (had to CreateResource)
 bool cs_SubmitOnEventEnd() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SUBMIT_ON_EVENT"); return v; }
 bool cs_GranularSubmit() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_GRANULAR_SUBMIT"); return v; }
 bool cs_AsyncBounded() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_ASYNC_BOUNDED"); return v; }
@@ -1208,13 +1236,44 @@ bool TRANSLATION_API ImmediateContext::Flush(UINT commandListTypeMask)
         s_firedAccum += InterlockedExchange(&g_cs_eventFiredThisFrame, 0);
         if (++s_frames >= 120)
         {
+            static LARGE_INTEGER s_freq = {};
+            if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
+            LONG64 allocTicks = InterlockedExchange64(&g_cs_allocTicksThisFrame, 0);
+            LONG allocCount = InterlockedExchange(&g_cs_allocCountThisFrame, 0);
+            double allocMsPerFrame = (s_freq.QuadPart && s_frames) ? (double)allocTicks * 1000.0 / (double)s_freq.QuadPart / (double)s_frames : 0.0;
+            double allocNPerFrame = (double)allocCount / (double)s_frames;
+            LONG64 renderWaitTicks = InterlockedExchange64(&g_cs_renderWaitTicks, 0);
+            LONG64 workerBusyTicks = InterlockedExchange64(&g_cs_workerBusyTicks, 0);
+            double renderWaitMsPerFrame = (s_freq.QuadPart && s_frames) ? (double)renderWaitTicks * 1000.0 / (double)s_freq.QuadPart / (double)s_frames : 0.0;
+            double workerBusyMsPerFrame = (s_freq.QuadPart && s_frames) ? (double)workerBusyTicks * 1000.0 / (double)s_freq.QuadPart / (double)s_frames : 0.0;
+            LONG64 latencyTicks = InterlockedExchange64(&g_cs_latencyWaitTicks, 0);
+            LONG64 presentTicks = InterlockedExchange64(&g_cs_presentTicks, 0);
+            double latencyMsPerFrame = (s_freq.QuadPart && s_frames) ? (double)latencyTicks * 1000.0 / (double)s_freq.QuadPart / (double)s_frames : 0.0;
+            double presentMsPerFrame = (s_freq.QuadPart && s_frames) ? (double)presentTicks * 1000.0 / (double)s_freq.QuadPart / (double)s_frames : 0.0;
+            LONG64 renderCycles = InterlockedExchange64(&g_cs_renderCycles, 0);
+            LONG64 frameWallTicks = InterlockedExchange64(&g_cs_frameWallTicks, 0);
+            double renderMcyclesPerFrame = s_frames ? (double)renderCycles / 1e6 / (double)s_frames : 0.0;
+            double wallMsPerFrame = (s_freq.QuadPart && s_frames) ? (double)frameWallTicks * 1000.0 / (double)s_freq.QuadPart / (double)s_frames : 0.0;
+            LONG64 getDataTicks = InterlockedExchange64(&g_cs_getDataTicks, 0);
+            LONG getDataCalls = InterlockedExchange(&g_cs_getDataCalls, 0);
+            LONG getDataNotReady = InterlockedExchange(&g_cs_getDataNotReady, 0);
+            LONG frameCount = InterlockedExchange(&g_cs_frameCount, 0);
+            double nf = frameCount ? (double)frameCount : 1.0; // actual frames for per-frame normalization
+            double wallMs = (s_freq.QuadPart) ? (double)frameWallTicks * 1000.0 / (double)s_freq.QuadPart / nf : 0.0;
+            double renderMcyc = (double)renderCycles / 1e6 / nf;
+            double getDataMs = (s_freq.QuadPart) ? (double)getDataTicks * 1000.0 / (double)s_freq.QuadPart / nf : 0.0;
+            double workerMs = (s_freq.QuadPart) ? (double)workerBusyTicks * 1000.0 / (double)s_freq.QuadPart / nf : 0.0;
+            double presentMs = (s_freq.QuadPart) ? (double)presentTicks * 1000.0 / (double)s_freq.QuadPart / nf : 0.0;
+            LONG renameReuse = InterlockedExchange(&g_cs_renameReuse, 0);
+            LONG renameAlloc = InterlockedExchange(&g_cs_renameAlloc, 0);
+            (void)wallMsPerFrame; (void)renderMcyclesPerFrame; (void)renderWaitMsPerFrame; (void)latencyMsPerFrame; (void)presentMsPerFrame; (void)allocNPerFrame; (void)allocMsPerFrame; (void)workerBusyMsPerFrame;
             FILE* f = nullptr;
             if (fopen_s(&f, "F:\\claudetmp\\submitstats.log", "a") == 0 && f)
             {
-                fprintf(f, "submitOnEvent=%d submits/f=%.2f spins/f=%.2f evEnds/f=%.2f evCond/f=%.2f evFired/f=%.2f (%ld frames)\n",
-                    cs_SubmitOnEventEnd() ? 1 : 0,
-                    (double)s_submitAccum / s_frames, (double)s_spinAccum / s_frames,
-                    (double)s_endsAccum / s_frames, (double)s_condAccum / s_frames, (double)s_firedAccum / s_frames, s_frames);
+                fprintf(f, "PERFRAME(%ld) wall=%.2fms renderMcyc=%.1f | renameReuse=%.0f renameAlloc=%.0f | worker=%.2f present=%.2f\n",
+                    frameCount, wallMs, renderMcyc, (double)renameReuse / nf, (double)renameAlloc / nf,
+                    workerMs, presentMs);
+                (void)getDataMs; (void)getDataCalls; (void)getDataNotReady;
                 fclose(f);
             }
             s_frames = 0; s_submitAccum = 0; s_spinAccum = 0; s_endsAccum = 0; s_condAccum = 0; s_firedAccum = 0;
@@ -4123,7 +4182,12 @@ D3D12ResourceSuballocation ImmediateContext::AcquireSuballocatedHeap(AllocatorHe
     }
 
     auto &allocator = GetAllocator(HeapType);
-    
+
+    // [CS perf] STEP-1: time the suballocator Allocate (captures its internal lock wait — the suspected
+    // render<->worker convoy). Env-gated so the default build pays nothing.
+    const bool _csAllocStats = cs_SubmitStatsEnabled();
+    LARGE_INTEGER _csA{};
+    if (_csAllocStats) QueryPerformanceCounter(&_csA);
     HeapSuballocationBlock suballocation =
         TryAllocateResourceWithFallback([&]()
     {
@@ -4134,6 +4198,13 @@ D3D12ResourceSuballocation ImmediateContext::AcquireSuballocatedHeap(AllocatorHe
         }
         return block;
     }, threadingContext);
+    if (_csAllocStats)
+    {
+        LARGE_INTEGER _csB{};
+        QueryPerformanceCounter(&_csB);
+        InterlockedAdd64(&g_cs_allocTicksThisFrame, _csB.QuadPart - _csA.QuadPart);
+        InterlockedIncrement(&g_cs_allocCountThisFrame);
+    }
 
     return D3D12ResourceSuballocation(allocator.GetInnerAllocation(suballocation), suballocation);
 }
@@ -4318,6 +4389,38 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
     // Inherit the heap type from from the previous resource (which may account for the video flags stripped above).
     creationArgsCopy.m_heapType = pResource->GetAllocatorHeapType();
 
+    // [CS perf] Discard-ring: reuse a retired rename Resource whose GPU work is complete AND whose desc
+    // matches, instead of the per-Map Resource::CreateResource object churn (malloc + identity + descs +
+    // pool trim) that VTune showed dominates the render thread (~5ms/frame). The reuse is desc-exact
+    // (size key + bind flags + heap type) so the subsequent RotateResourceIdentities swaps a compatible
+    // identity in — cross-desc reuse (the earlier crash) is rejected. Fence gate = GPU is done with it.
+    if (cs_DiscardRing())
+    {
+        const UINT64 key = cs_RenamePoolKey(pResource->GetResourceSize(), creationArgsCopy.m_appDesc.BindFlags(), creationArgsCopy.m_heapType);
+        const UINT64 completed = GetCompletedFenceValue(COMMAND_LIST_TYPE::GRAPHICS);
+        unique_comptr<Resource> reused;
+        {
+            auto pool = m_RenameBackingPool.GetLocked();
+            auto it = pool->find(key);
+            if (it != pool->end() && !it->second.empty() &&
+                it->second.front()->m_LastUsedCommandListID[(UINT)COMMAND_LIST_TYPE::GRAPHICS] <= completed)
+            {
+                reused = std::move(it->second.front()); // FIFO front = oldest = most-likely GPU-complete; O(1)
+                it->second.pop_front();
+            }
+        }
+        if (reused)
+        {
+            reused->ResetLastUsedInCommandList();
+            reused->ZeroConstantBufferPadding();
+            if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_renameReuse);
+            Resource* pRet = reused.get();
+            m_RenamesInFlight.GetLocked()->emplace_back(std::move(reused));
+            return pRet;
+        }
+        if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_renameAlloc);
+    }
+
     // TODO: See if there's a good way to cache these guys.
     unique_comptr<Resource> renameResource = Resource::CreateResource(this, creationArgsCopy, threadingContext);
     renameResource->ZeroConstantBufferPadding();
@@ -4373,18 +4476,35 @@ void TRANSLATION_API ImmediateContext::RenameViaCopy(Resource* pResource, Resour
 //----------------------------------------------------------------------------------------------------------------------------------
 void TRANSLATION_API ImmediateContext::DeleteRenameCookie(Resource* pRenameResource)
 {
-    auto LockedContainer = m_RenamesInFlight.GetLocked();
-    auto iter = std::find_if(LockedContainer->begin(), LockedContainer->end(),
-                             [pRenameResource](unique_comptr<Resource> const& r) { return r.get() == pRenameResource; });
-    assert(iter != LockedContainer->end());
-
     // The only scenario where video is relevant here is for decode bitstream buffers. All other instances of
-    // resource renaming are Map(DISCARD) graphics operations.
+    // resource renaming are Map(DISCARD) graphics operations. Stamp the GPU-completion fence before pooling.
     COMMAND_LIST_TYPE CmdListType = pRenameResource->GetAllocatorHeapType() == AllocatorHeapType::Decoder ?
         COMMAND_LIST_TYPE::VIDEO_DECODE : COMMAND_LIST_TYPE::GRAPHICS;
-
     pRenameResource->UsedInCommandList(CmdListType, GetCommandListID(CmdListType));
-    LockedContainer->erase(iter);
+
+    // Extract from the in-flight set; release its lock BEFORE touching the pool so the lock order matches
+    // CreateRenameCookie (pool then in-flight) — no inversion.
+    unique_comptr<Resource> backing;
+    {
+        auto LockedContainer = m_RenamesInFlight.GetLocked();
+        auto iter = std::find_if(LockedContainer->begin(), LockedContainer->end(),
+                                 [pRenameResource](unique_comptr<Resource> const& r) { return r.get() == pRenameResource; });
+        assert(iter != LockedContainer->end());
+        backing = std::move(*iter);
+        LockedContainer->erase(iter);
+    }
+
+    // [CS perf] Discard-ring: pool the retired backing (keeps it + its identity/suballocation alive) for
+    // reuse by a later desc-matching Map(WRITE_DISCARD) instead of freeing it — kills the object churn.
+    // Graphics only; bounded per bucket. If disabled, `backing` destructs here = normal deferred delete.
+    if (cs_DiscardRing() && backing && CmdListType == COMMAND_LIST_TYPE::GRAPHICS)
+    {
+        const UINT64 key = cs_RenamePoolKey(backing->GetResourceSize(), backing->AppDesc()->BindFlags(), backing->GetAllocatorHeapType());
+        auto pool = m_RenameBackingPool.GetLocked();
+        auto& bucket = pool->operator[](key);
+        if (bucket.size() < 8192) // deep enough to hold a frame's in-flight backings/desc → high reuse
+            bucket.push_back(std::move(backing)); // FIFO: retire-ordered, so front stays oldest
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------

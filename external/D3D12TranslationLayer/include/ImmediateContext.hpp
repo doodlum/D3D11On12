@@ -15,7 +15,20 @@ extern volatile LONG g_cs_eventSpinsThisFrame;
 extern volatile LONG g_cs_eventEndsThisFrame;   // Async::End reached with an EVENT query
 extern volatile LONG g_cs_eventCondThisFrame;   // submit-on-EVENT guard passed
 extern volatile LONG g_cs_eventFiredThisFrame;  // SubmitCommandList actually ran
+extern volatile LONG64 g_cs_renderWaitTicks;    // [CS perf] render-thread time blocked in WaitForSingleBatch (waiting for the worker)
+extern volatile LONG64 g_cs_workerBusyTicks;    // [CS perf] worker-thread time in ProcessBatchImpl (actual translation/replay work)
+extern volatile LONG64 g_cs_latencyWaitTicks;   // [CS perf] render-thread time in WaitForMaximumFrameLatency (frame-latency fence)
+extern volatile LONG64 g_cs_presentTicks;       // [CS perf] render-thread time in the actual present (pfnPresentCb / StandardPresent)
+extern volatile LONG64 g_cs_renderCycles;       // [CS perf] render-thread CPU cycles/frame (QueryThreadCycleTime) — CPU-bound vs blocked
+extern volatile LONG64 g_cs_frameWallTicks;     // [CS perf] wall-clock QPC ticks/frame (present-to-present, for the busy fraction)
+extern volatile LONG64 g_cs_getDataTicks;       // [CS perf] render-thread time in QueryGetData (Skyrim's upload-ring EVENT poll)
+extern volatile LONG   g_cs_getDataCalls;       // [CS perf] QueryGetData calls/frame
+extern volatile LONG   g_cs_getDataNotReady;    // [CS perf] QueryGetData S_FALSE (not-ready) returns/frame = the spin
+extern volatile LONG   g_cs_frameCount;         // [CS perf] actual frames (Present1 count) for correct per-frame normalization
 bool cs_SubmitStatsEnabled() noexcept;
+bool cs_DiscardRing() noexcept;
+extern volatile LONG g_cs_renameReuse;
+extern volatile LONG g_cs_renameAlloc;
 bool cs_SubmitOnEventEnd() noexcept;
 bool cs_GranularSubmit() noexcept;
 bool cs_AsyncBounded() noexcept;   // bounded async present (overlap, GPU capped to N frames behind)
@@ -1669,6 +1682,13 @@ private: // Dynamic/staging resource pools
     }
 
     COptLockedContainer<RenameResourceSet> m_RenamesInFlight;
+    // [CS perf] Discard-ring pool (CS_D3D11ON12_DISCARD_RING): retired rename Resource wrappers keyed by
+    // an EXACT desc composite (size|bindflags|heaptype), each bucket a FIFO deque. Retire pushes to the
+    // back; reuse pops the FRONT (oldest = most-likely GPU-complete) after a fence check — O(1), so a
+    // deep pool gives high reuse without a linear scan. Same key <=> interchangeable desc (no cross-desc
+    // reuse = the earlier crash). Kills the per-Map Resource::CreateResource object churn (malloc +
+    // identity + descs + pool trim) that VTune showed dominates the render thread (~16k renames/frame!).
+    COptLockedContainer<std::unordered_map<UINT64, std::deque<unique_comptr<Resource>>>> m_RenameBackingPool;
 
 private: // State tracking
     // Dirty states are marked during sets and converted to command list operations at draw time, to avoid multiple costly conversions due to 11/12 API differences

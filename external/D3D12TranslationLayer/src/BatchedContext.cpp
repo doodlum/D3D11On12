@@ -1945,7 +1945,19 @@ bool BatchedContext::IsBatchThreadIdle()
 bool BatchedContext::WaitForSingleBatch(DWORD timeout)
 {
     assert(!IsBatchThread());
-    if (WaitForSingleObject(m_BatchConsumedSemaphore, timeout) == WAIT_OBJECT_0)
+    // [CS perf] STEP-1b: time the render thread blocked waiting for the worker to consume a batch
+    // (back-pressure + present-drain). If this dominates the frame, the layer is worker-bound.
+    const bool _csStats = timeout != 0 && cs_SubmitStatsEnabled();
+    LARGE_INTEGER _csA{};
+    if (_csStats) QueryPerformanceCounter(&_csA);
+    DWORD _csWaitRes = WaitForSingleObject(m_BatchConsumedSemaphore, timeout);
+    if (_csStats)
+    {
+        LARGE_INTEGER _csB{};
+        QueryPerformanceCounter(&_csB);
+        InterlockedAdd64(&g_cs_renderWaitTicks, _csB.QuadPart - _csA.QuadPart);
+    }
+    if (_csWaitRes == WAIT_OBJECT_0)
     {
         --m_NumOutstandingBatches;
         if (m_bFlushPendingCallback.exchange(false))
@@ -1960,12 +1972,23 @@ bool BatchedContext::WaitForSingleBatch(DWORD timeout)
 //----------------------------------------------------------------------------------------------------------------------------------
 void BatchedContext::ProcessBatchImpl(Batch* pBatchToProcess)
 {
+    // [CS perf] STEP-1b: time the worker actually translating/replaying commands. If render-wait is high
+    // but worker-busy is low, the worker isn't the throughput limit — it's stalling on something (GPU/lock).
+    const bool _csStats = cs_SubmitStatsEnabled();
+    LARGE_INTEGER _csA{};
+    if (_csStats) QueryPerformanceCounter(&_csA);
     try
     {
         ProcessBatchWork(pBatchToProcess->m_BatchCommands); // throws
     }
     catch (_com_error& hrEx) { m_Callbacks.ThreadErrorCallback(hrEx.Error()); }
     catch (std::bad_alloc&) { m_Callbacks.ThreadErrorCallback(E_OUTOFMEMORY); }
+    if (_csStats)
+    {
+        LARGE_INTEGER _csB{};
+        QueryPerformanceCounter(&_csB);
+        InterlockedAdd64(&g_cs_workerBusyTicks, _csB.QuadPart - _csA.QuadPart);
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
