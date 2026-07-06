@@ -3,6 +3,9 @@
 #include "pch.hpp"
 #include "SwapChainHelper.hpp"
 
+#include <memory>
+#include <new>
+
 namespace D3D11On12
 {
     HRESULT APIENTRY Device::Present1(DXGI1_6_1_DDI_ARG_PRESENT* pArgs)
@@ -11,9 +14,31 @@ namespace D3D11On12
         Device *pDevice = Device::CastFrom(pArgs->hDevice);
 
         assert(pArgs->pDirtyRects == nullptr && pArgs->DirtyRects == 0);
-        
-        pDevice->GetBatchedContext().EmplaceBatchExtension<PresentExtensionData>(&pDevice->m_PresentExt, pArgs);
-        pDevice->GetBatchedContext().SubmitBatch();
+
+        // Drain all queued RENDER translation on the worker thread. This preserves
+        // render-before-present ordering AND guarantees the worker is idle (not touching the
+        // ImmediateContext), so the present can be driven inline on this app thread. Same
+        // drain semantics as every FlushBatchAndGetImmediateContext caller (Blt/Map/Read).
+        pDevice->GetBatchedContext().ProcessBatch();
+
+        // Run the present callback INLINE on the app thread instead of the batch worker
+        // thread. The Steam in-game overlay (gameoverlayrenderer64!OverlayHookD3D3) hooks
+        // present on the app thread and holds a critical section across the real present;
+        // running the callback on the worker re-enters that CS from a second thread while the
+        // app thread blocks in SubmitBatch's bounded-queue back-pressure -> AB/BA deadlock.
+        // Presenting inline keeps the overlay's present hook single-threaded. Worker-thread
+        // render batching is untouched (only the present extension stops running on the
+        // worker). Mirrors PresentExtension::Dispatch; Device::Present consumes m_pPresentArgs
+        // synchronously (copies + nulls it), so the stack-scoped buffer is safe.
+        const size_t extSize = PresentExtensionData::GetExtensionSize(pArgs);
+        auto storage = std::make_unique<uint64_t[]>((extSize + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+        auto* pPresentData = new (storage.get()) PresentExtensionData(pArgs);  // trivially destructible
+
+        pDevice->m_pPresentArgs = pPresentData;
+        DXGIDDICB_PRESENT CBArgs = {};
+        CBArgs.pDXGIContext = pPresentData->pDXGIContext;
+        ThrowFailure((*pDevice->m_pDXGICallbacks->pfnPresentCb)(pDevice->m_hRTDevice.handle, &CBArgs));
+
         D3D11on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
     }
 
