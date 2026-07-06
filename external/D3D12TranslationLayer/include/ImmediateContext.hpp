@@ -27,6 +27,7 @@ extern volatile LONG   g_cs_getDataNotReady;    // [CS perf] QueryGetData S_FALS
 extern volatile LONG   g_cs_frameCount;         // [CS perf] actual frames (Present1 count) for correct per-frame normalization
 bool cs_SubmitStatsEnabled() noexcept;
 bool cs_DiscardRing() noexcept;
+bool cs_SkipUpTrans() noexcept;
 extern volatile LONG g_cs_renameReuse;
 extern volatile LONG g_cs_renameAlloc;
 bool cs_SubmitOnEventEnd() noexcept;

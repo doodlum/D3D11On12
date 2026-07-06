@@ -1178,6 +1178,9 @@ bool cs_SubmitStatsEnabled() noexcept { static const bool v = cs_ReadEnvFlag("CS
 // [CS perf] DEFAULT-ON: the O(1) FIFO rename-backing pool is a proven +35% (44->61fps), clean, stable win.
 // Disable only with CS_D3D11ON12_DISCARD_RING=0 (for A/B).
 bool cs_DiscardRing() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_DISCARD_RING", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
+// [CS perf] DEFAULT-ON: skipping no-op upload-heap transitions in rename rotation is a proven clean +3-4fps
+// (worker-side cut, the worker gates the frame). Disable with CS_D3D11ON12_SKIPUPTRANS=0.
+bool cs_SkipUpTrans() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_SKIPUPTRANS", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
 // [CS perf] EXACT desc composite key for the rename backing pool: size (low 40b) | bindflags (16b) |
 // heaptype (8b). Same key <=> interchangeable backing (same size+bindflags+heaptype), so a bucket is
 // desc-uniform and the FIFO front is always a valid reuse candidate (only the fence needs checking).
@@ -5513,7 +5516,14 @@ void TRANSLATION_API ImmediateContext::RotateResourceIdentities(Resource* const*
             stageState.m_CBs.SetDirtyBits(bindingState.m_ConstantBufferBindings[stage]);
         }
 
-        m_ResourceStateManager.TransitionResourceForBindings(pLastResource);
+        // [CS perf] Upload-heap resources (dynamic buffers + rename backings) are permanently GENERIC_READ
+        // in D3D12 and never transition, so this enqueues a no-op into the ApplyAllResourceTransitions drain.
+        // Env-gated (CS_D3D11ON12_SKIPUPTRANS) for a clean A/B — the worker is the frame gate, so a worker-
+        // side cut should translate to fps (unlike coupling-gated render-side cuts).
+        if (!cs_SkipUpTrans() || pLastResource->GetAllocatorHeapType() != AllocatorHeapType::Upload)
+        {
+            m_ResourceStateManager.TransitionResourceForBindings(pLastResource);
+        }
 
         if (i < Resources)
         {
