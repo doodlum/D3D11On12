@@ -4412,7 +4412,10 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
         if (reused)
         {
             reused->ResetLastUsedInCommandList();
-            reused->ZeroConstantBufferPadding();
+            // NOTE: no ZeroConstantBufferPadding() here — the pooled backing was zeroed at creation and its
+            // padding [Width, AlignedSize) is never written (the app WRITE_DISCARDs only Width bytes and the
+            // suballocation is owned by this backing, never shared), so it stays zero. Re-zeroing 16k/frame
+            // was ~0.7s of the profile (VTune vt3). Skipping it is safe.
             if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_renameReuse);
             Resource* pRet = reused.get();
             m_RenamesInFlight.GetLocked()->emplace_back(std::move(reused));
