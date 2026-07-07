@@ -1177,15 +1177,13 @@ static bool cs_ReadEnvFlag(const char* name) noexcept
 bool cs_SubmitStatsEnabled() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SUBMIT_STATS"); return v; }
 // [CS perf] DEFAULT-ON: the O(1) FIFO rename-backing pool is a proven +35% (44->61fps), clean, stable win.
 // Disable only with CS_D3D11ON12_DISCARD_RING=0 (for A/B).
-// [CS] TEMPORARILY DEFAULT-OFF (guaranteed-clean fallback while the red-flash corruption is diagnosed). With the
-// ring OFF, every rename gets a fresh always-zeroed allocation = the original layer behaviour that never corrupted
-// (~44-50fps). Re-enable (default-on) once the reuse-path corruption is fully fixed+verified. Force-on: =1.
-bool cs_DiscardRing() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_DISCARD_RING"); return v; }
+// [CS] DEFAULT-ON again: the red-flash corruption is fixed at its root (ZeroFullCB zeroes the whole reused buffer),
+// so the discard-ring reuse is safe now. Disable with CS_D3D11ON12_DISCARD_RING=0.
+bool cs_DiscardRing() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_DISCARD_RING", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
 // [CS perf] DEFAULT-ON: skipping no-op upload-heap transitions in rename rotation is a proven clean +3-4fps
 // (worker-side cut, the worker gates the frame). Disable with CS_D3D11ON12_SKIPUPTRANS=0.
-// [CS] TEMPORARILY DEFAULT-OFF too (pure-baseline build to isolate the combat-only red-flash that survives with
-// the discard-ring off). Re-enable (=1 or default-on) once the combat source is found. Barrier-skip = suspect #2.
-bool cs_SkipUpTrans() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SKIPUPTRANS"); return v; }
+// [CS] DEFAULT-ON again: the corruption was the data-region (ZeroFullCB fixed it), not this barrier-skip. Re-enabled.
+bool cs_SkipUpTrans() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_SKIPUPTRANS", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
 // [CS perf] Collapse redundant per-subresource/re-bind Resource::UsedInCommandList repeats. Env-gated for A/B.
 bool cs_SkipRedundantUsed() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SKIPREDUNDANTUSED"); return v; }
 // [CS perf] Cache the GPU VA to skip a per-CB-per-draw virtual COM call. Env-gated for A/B.
