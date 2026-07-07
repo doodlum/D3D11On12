@@ -604,6 +604,15 @@ namespace D3D12TranslationLayer
     void Resource::UsedInCommandList(COMMAND_LIST_TYPE commandListType, UINT64 id)
     {
         assert(commandListType != COMMAND_LIST_TYPE::UNKNOWN);
+        // [CS perf] Collapse redundant repeats. The transition drain calls this once per SUBRESOURCE
+        // (PostSubmitUpdateState fans out per-subresource), and resources are re-bound across draws,
+        // but residency (ResidencySet::Insert de-dups) and the fence stamp are per-RESOURCE and
+        // idempotent. If this resource is already marked for this exact command list, nothing remains.
+        // Safe: command-list ids start at 1 (CommandListManager m_commandListID=1) while the stamp
+        // inits/resets to 0, so `== id` fires only for a genuine same-command-list repeat, never a
+        // first use; renames reset the stamp (UnderlyingResourceChanged -> ResetLastUsedInCommandList).
+        if (cs_SkipRedundantUsed() && m_LastUsedCommandListID[(UINT)commandListType] == id)
+            return;
         m_pParent->AddObjectToResidencySet(this, commandListType);
         if (m_Identity && m_Identity->HasRestrictedOutstandingResources())
         {

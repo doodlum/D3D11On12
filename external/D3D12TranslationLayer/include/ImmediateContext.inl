@@ -942,8 +942,8 @@ inline void GetBufferViewDesc(Resource* pBuffer, TDesc& Desc, UINT APIOffset, UI
         Desc.SizeInBytes =
             min(GetDynamicBufferSize<TDesc>(pBuffer, APIOffset), APISize);
         Desc.BufferLocation = Desc.SizeInBytes == 0 ? 0 :
-            // TODO: Cache the GPU VA, frequent calls to this cause a CPU hotspot
-            (pBuffer->GetUnderlyingResource()->GetGPUVirtualAddress() // Base of the DX12 resource
+            // [CS perf] GPU-VA cache (env CS_D3D11ON12_VACACHE) collapses the per-CB-per-draw COM call.
+            ((cs_VACache() ? pBuffer->GetCachedGPUVA() : pBuffer->GetUnderlyingResource()->GetGPUVirtualAddress()) // Base of the DX12 resource
                 + pBuffer->GetSubresourcePlacement(0).Offset // Base of the DX11 resource after renaming
                 + APIOffset); // Offset from the base of the DX11 resource
     }

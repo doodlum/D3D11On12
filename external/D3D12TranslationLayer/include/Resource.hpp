@@ -418,6 +418,16 @@ namespace D3D12TranslationLayer
         AppResourceDesc* AppDesc() { return &m_creationArgs.m_appDesc; }
 
         ID3D12Resource* GetUnderlyingResource() noexcept { return m_Identity->GetResource(); }
+        // [CS perf] Cache the GPU VA to avoid a virtual COM call (GetGPUVirtualAddress) per CB per draw
+        // (flagged as a CPU hotspot in GetBufferViewDesc; ~16k renames force CB-dirty every draw). Keyed on
+        // the underlying ID3D12Resource* — identical pointer guarantees identical VA, so this auto-invalidates
+        // on any rename/identity swap and can never go stale. The suballoc offset is read separately.
+        D3D12_GPU_VIRTUAL_ADDRESS GetCachedGPUVA() noexcept
+        {
+            ID3D12Resource* res = m_Identity->GetResource();
+            if (res != m_CachedVARes) { m_CachedVA = res->GetGPUVirtualAddress(); m_CachedVARes = res; }
+            return m_CachedVA;
+        }
         void UnderlyingResourceChanged() noexcept(false);
         void ZeroConstantBufferPadding() noexcept;
 
@@ -800,6 +810,10 @@ namespace D3D12TranslationLayer
 
         // All resources
         std::unique_ptr<SResourceIdentity> m_Identity;
+
+        // [CS perf] GPU-VA cache (see GetCachedGPUVA) — keyed on the underlying ID3D12Resource*.
+        ID3D12Resource* m_CachedVARes = nullptr;
+        D3D12_GPU_VIRTUAL_ADDRESS m_CachedVA = 0;
 
         CResourceBindings m_currentBindings;
 

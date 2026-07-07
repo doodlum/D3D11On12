@@ -28,6 +28,9 @@ extern volatile LONG   g_cs_frameCount;         // [CS perf] actual frames (Pres
 bool cs_SubmitStatsEnabled() noexcept;
 bool cs_DiscardRing() noexcept;
 bool cs_SkipUpTrans() noexcept;
+bool cs_SkipRedundantUsed() noexcept;
+bool cs_VACache() noexcept;
+bool cs_RenameNoInflight() noexcept;
 extern volatile LONG g_cs_renameReuse;
 extern volatile LONG g_cs_renameAlloc;
 bool cs_SubmitOnEventEnd() noexcept;

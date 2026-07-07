@@ -1181,6 +1181,15 @@ bool cs_DiscardRing() noexcept { static const bool v = []{ char b[8] = {}; retur
 // [CS perf] DEFAULT-ON: skipping no-op upload-heap transitions in rename rotation is a proven clean +3-4fps
 // (worker-side cut, the worker gates the frame). Disable with CS_D3D11ON12_SKIPUPTRANS=0.
 bool cs_SkipUpTrans() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_SKIPUPTRANS", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
+// [CS perf] Collapse redundant per-subresource/re-bind Resource::UsedInCommandList repeats. Env-gated for A/B.
+bool cs_SkipRedundantUsed() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SKIPREDUNDANTUSED"); return v; }
+// [CS perf] Cache the GPU VA to skip a per-CB-per-draw virtual COM call. Env-gated for A/B.
+bool cs_VACache() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_VACACHE"); return v; }
+// [CS perf] Eliminate m_RenamesInFlight — pass rename-backing ownership through the cookie instead of a shared
+// locked set, removing a mutex + find_if/erase on both render (create) and worker (delete). Env-gated for A/B.
+// [CS perf] DEFAULT-ON: eliminating m_RenamesInFlight is a proven clean +4.7fps (cuts rename-pool lock
+// contention on both threads). Disable with CS_D3D11ON12_RENAMENOINFLIGHT=0.
+bool cs_RenameNoInflight() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_RENAMENOINFLIGHT", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
 // [CS perf] EXACT desc composite key for the rename backing pool: size (low 40b) | bindflags (16b) |
 // heaptype (8b). Same key <=> interchangeable backing (same size+bindflags+heaptype), so a bucket is
 // desc-uniform and the FIFO front is always a valid reuse candidate (only the fence needs checking).
@@ -4420,6 +4429,12 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
             // suballocation is owned by this backing, never shared), so it stays zero. Re-zeroing 16k/frame
             // was ~0.7s of the profile (VTune vt3). Skipping it is safe.
             if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_renameReuse);
+            // [CS perf] cs_RenameNoInflight: hand the sole ref out as a raw pointer (release() keeps the ref,
+            // no Release). The cookie carries it to DeleteRenameCookie which re-adopts it — skips parking it in
+            // m_RenamesInFlight, removing a lock + a find_if/erase on BOTH threads. m_RenamesInFlight plays no
+            // role in fence-gating (that's the pool + m_LastUsedCommandListID), so this is refcount-neutral.
+            if (cs_RenameNoInflight())
+                return reused.release();
             Resource* pRet = reused.get();
             m_RenamesInFlight.GetLocked()->emplace_back(std::move(reused));
             return pRet;
@@ -4436,6 +4451,8 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
 
     assert(renameResource->GetAllocatorHeapType() == pResource->GetAllocatorHeapType());
 
+    if (cs_RenameNoInflight())
+        return renameResource.release(); // hand the sole ref out as a raw ptr (also skips a redundant AddRef/Release)
     m_RenamesInFlight.GetLocked()->emplace_back(renameResource.get());
     return renameResource.get();
 }
@@ -4491,6 +4508,13 @@ void TRANSLATION_API ImmediateContext::DeleteRenameCookie(Resource* pRenameResou
     // Extract from the in-flight set; release its lock BEFORE touching the pool so the lock order matches
     // CreateRenameCookie (pool then in-flight) — no inversion.
     unique_comptr<Resource> backing;
+    if (cs_RenameNoInflight())
+    {
+        // [CS perf] Adopt the in-transit ref that CreateRenameCookie released to the cookie (operator& takes
+        // ownership without AddRef; backing starts null so the assert holds). No in-flight lock / find_if.
+        *(&backing) = pRenameResource;
+    }
+    else
     {
         auto LockedContainer = m_RenamesInFlight.GetLocked();
         auto iter = std::find_if(LockedContainer->begin(), LockedContainer->end(),
