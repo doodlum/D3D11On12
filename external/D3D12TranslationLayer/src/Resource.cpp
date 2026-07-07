@@ -684,6 +684,33 @@ namespace D3D12TranslationLayer
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
+    // [CS debug] Deterministic repro for the red-flash bug: fill the CBV padding [Width, AlignedSize) with a
+    // float quiet-NaN pattern on retire. If a later reuse fails to re-zero the padding, the shader's CBV reads
+    // NaN → obvious blown-out/red constant, making the intermittent bug reproducible. Env-gated, default-off.
+    void Resource::DebugFillConstantBufferPaddingNaN() noexcept
+    {
+        if ((AppDesc()->BindFlags() & RESOURCE_BIND_CONSTANT_BUFFER) == 0 ||
+            AppDesc()->Width() % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0 ||
+            m_Identity->m_bOwnsUnderlyingResource)
+        {
+            return;
+        }
+        UINT64 AlignedSize = m_SubresourcePlacement[0].Footprint.RowPitch;
+        SIZE_T FillSize = static_cast<SIZE_T>(AlignedSize - AppDesc()->Width());
+        void* pData;
+        CD3DX12_RANGE ReadRange(0, 0);
+        HRESULT hr = GetUnderlyingResource()->Map(0, &ReadRange, &pData);
+        if (SUCCEEDED(hr))
+        {
+            BYTE* pAddr = reinterpret_cast<BYTE*>(pData) + m_SubresourcePlacement[0].Offset + AppDesc()->Width();
+            for (SIZE_T i = 0; i + 4 <= FillSize; i += 4) *reinterpret_cast<UINT32*>(pAddr + i) = 0x7FC00000u;
+            CD3DX12_RANGE WrittenRange(SIZE_T(m_SubresourcePlacement[0].Offset) + AppDesc()->Width(), 0);
+            WrittenRange.End = WrittenRange.Begin + FillSize;
+            GetUnderlyingResource()->Unmap(0, &WrittenRange);
+        }
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT& Resource::GetSubresourcePlacement(UINT subresource) noexcept
     {
         return m_SubresourcePlacement[subresource];

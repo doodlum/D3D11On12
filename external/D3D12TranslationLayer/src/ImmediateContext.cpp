@@ -1187,9 +1187,14 @@ bool cs_SkipRedundantUsed() noexcept { static const bool v = cs_ReadEnvFlag("CS_
 bool cs_VACache() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_VACACHE"); return v; }
 // [CS perf] Eliminate m_RenamesInFlight — pass rename-backing ownership through the cookie instead of a shared
 // locked set, removing a mutex + find_if/erase on both render (create) and worker (delete). Env-gated for A/B.
-// [CS perf] DEFAULT-ON: eliminating m_RenamesInFlight is a proven clean +4.7fps (cuts rename-pool lock
-// contention on both threads). Disable with CS_D3D11ON12_RENAMENOINFLIGHT=0.
-bool cs_RenameNoInflight() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_RENAMENOINFLIGHT", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
+// [CS perf] Eliminate m_RenamesInFlight (cuts rename-pool lock contention on both threads, +4.7fps). Was
+// default-on, but reverted to DEFAULT-OFF while investigating an intermittent red-flash corruption report —
+// this ownership rework is the prime suspect (refcount race). Re-enable for A/B via CS_D3D11ON12_RENAMENOINFLIGHT=1.
+bool cs_RenameNoInflight() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_RENAMENOINFLIGHT"); return v; }
+// [CS fix] DEFAULT-ON correctness fix: re-zero CBV padding on discard-ring reuse (prevents stale-padding red-flash).
+bool cs_ZeroPadOnReuse() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_ZEROPADREUSE", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
+// [CS debug] DEFAULT-OFF stress: NaN-fill retired backing padding to make the red-flash bug deterministic.
+bool cs_NanFill() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_NANFILL"); return v; }
 // [CS perf] EXACT desc composite key for the rename backing pool: size (low 40b) | bindflags (16b) |
 // heaptype (8b). Same key <=> interchangeable backing (same size+bindflags+heaptype), so a bucket is
 // desc-uniform and the FIFO front is always a valid reuse candidate (only the fence needs checking).
@@ -4424,10 +4429,17 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
         if (reused)
         {
             reused->ResetLastUsedInCommandList();
-            // NOTE: no ZeroConstantBufferPadding() here — the pooled backing was zeroed at creation and its
-            // padding [Width, AlignedSize) is never written (the app WRITE_DISCARDs only Width bytes and the
-            // suballocation is owned by this backing, never shared), so it stays zero. Re-zeroing 16k/frame
-            // was ~0.7s of the profile (VTune vt3). Skipping it is safe.
+            // [CS fix — red-flash corruption] Re-zero the CBV padding [Width, AlignedSize) on reuse. The pool
+            // is keyed on the 256-ALIGNED size, so CBs of different Widths that round to the same boundary
+            // (e.g. 208 and 240, both RowPitch 256) share a bucket; and SwapIdentities circulates suballocations
+            // between app buffers and backings every rename. A reused backing can therefore carry another CB's
+            // (or the app buffer's uninitialised) stale bytes in [Width, AlignedSize) — the app WRITE_DISCARDs
+            // only [0, Width) but the shader's CBV spans the full aligned range → a garbage/NaN constant →
+            // per-object corruption ("specific objects tinted red"). ZeroConstantBufferPadding self-gates
+            // (no-op unless Width % 256 != 0), so 256-aligned CBs (the common case) still pay nothing. The
+            // earlier "padding stays zero, skip is safe" claim was WRONG — the suballocation is not owned.
+            // Env-gate default-ON so the fix can be A/B'd against the NaN-fill repro (CS_D3D11ON12_ZEROPADREUSE=0).
+            if (cs_ZeroPadOnReuse()) reused->ZeroConstantBufferPadding();
             if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_renameReuse);
             // [CS perf] cs_RenameNoInflight: hand the sole ref out as a raw pointer (release() keeps the ref,
             // no Release). The cookie carries it to DeleteRenameCookie which re-adopts it — skips parking it in
@@ -4529,6 +4541,8 @@ void TRANSLATION_API ImmediateContext::DeleteRenameCookie(Resource* pRenameResou
     // Graphics only; bounded per bucket. If disabled, `backing` destructs here = normal deferred delete.
     if (cs_DiscardRing() && backing && CmdListType == COMMAND_LIST_TYPE::GRAPHICS)
     {
+        // [CS debug] Poison the padding on retire so any reuse that fails to re-zero it reads NaN (repro).
+        if (cs_NanFill()) backing->DebugFillConstantBufferPaddingNaN();
         const UINT64 key = cs_RenamePoolKey(backing->GetResourceSize(), backing->AppDesc()->BindFlags(), backing->GetAllocatorHeapType());
         auto pool = m_RenameBackingPool.GetLocked();
         auto& bucket = pool->operator[](key);

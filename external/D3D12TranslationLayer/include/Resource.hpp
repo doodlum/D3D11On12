@@ -430,6 +430,7 @@ namespace D3D12TranslationLayer
         }
         void UnderlyingResourceChanged() noexcept(false);
         void ZeroConstantBufferPadding() noexcept;
+        void DebugFillConstantBufferPaddingNaN() noexcept; // [CS debug] stress repro for red-flash (env-gated)
 
         UINT NumSubresources() noexcept { return AppDesc()->Subresources() * m_SubresourceMultiplier; }
         UINT8 SubresourceMultiplier() noexcept { return m_SubresourceMultiplier; }
