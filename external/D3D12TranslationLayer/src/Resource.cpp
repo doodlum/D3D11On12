@@ -689,22 +689,27 @@ namespace D3D12TranslationLayer
     // NaN → obvious blown-out/red constant, making the intermittent bug reproducible. Env-gated, default-off.
     void Resource::DebugFillConstantBufferPaddingNaN() noexcept
     {
+        // cs_NanFillFull: poison the ENTIRE buffer [0, AlignedSize) (incl the data region [0,Width)) to test
+        // whether Skyrim fully overwrites the data region on Map(DISCARD). If a reused backing's data region
+        // survives (app partial-writes), the poison shows → the padding-only fix is insufficient.
+        const bool full = cs_NanFillFull();
         if ((AppDesc()->BindFlags() & RESOURCE_BIND_CONSTANT_BUFFER) == 0 ||
-            AppDesc()->Width() % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0 ||
+            (!full && AppDesc()->Width() % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0) ||
             m_Identity->m_bOwnsUnderlyingResource)
         {
             return;
         }
         UINT64 AlignedSize = m_SubresourcePlacement[0].Footprint.RowPitch;
-        SIZE_T FillSize = static_cast<SIZE_T>(AlignedSize - AppDesc()->Width());
+        const SIZE_T startOff = full ? 0u : static_cast<SIZE_T>(AppDesc()->Width());
+        SIZE_T FillSize = static_cast<SIZE_T>(AlignedSize) - startOff;
         void* pData;
         CD3DX12_RANGE ReadRange(0, 0);
         HRESULT hr = GetUnderlyingResource()->Map(0, &ReadRange, &pData);
         if (SUCCEEDED(hr))
         {
-            BYTE* pAddr = reinterpret_cast<BYTE*>(pData) + m_SubresourcePlacement[0].Offset + AppDesc()->Width();
+            BYTE* pAddr = reinterpret_cast<BYTE*>(pData) + m_SubresourcePlacement[0].Offset + startOff;
             for (SIZE_T i = 0; i + 4 <= FillSize; i += 4) *reinterpret_cast<UINT32*>(pAddr + i) = 0x7FC00000u;
-            CD3DX12_RANGE WrittenRange(SIZE_T(m_SubresourcePlacement[0].Offset) + AppDesc()->Width(), 0);
+            CD3DX12_RANGE WrittenRange(SIZE_T(m_SubresourcePlacement[0].Offset) + startOff, 0);
             WrittenRange.End = WrittenRange.Begin + FillSize;
             GetUnderlyingResource()->Unmap(0, &WrittenRange);
         }

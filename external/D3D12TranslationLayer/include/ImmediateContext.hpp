@@ -33,6 +33,7 @@ bool cs_VACache() noexcept;
 bool cs_RenameNoInflight() noexcept;
 bool cs_ZeroPadOnReuse() noexcept;
 bool cs_NanFill() noexcept;
+bool cs_NanFillFull() noexcept;
 extern volatile LONG g_cs_renameReuse;
 extern volatile LONG g_cs_renameAlloc;
 bool cs_SubmitOnEventEnd() noexcept;

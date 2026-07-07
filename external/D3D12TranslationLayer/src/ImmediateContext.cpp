@@ -1177,7 +1177,10 @@ static bool cs_ReadEnvFlag(const char* name) noexcept
 bool cs_SubmitStatsEnabled() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SUBMIT_STATS"); return v; }
 // [CS perf] DEFAULT-ON: the O(1) FIFO rename-backing pool is a proven +35% (44->61fps), clean, stable win.
 // Disable only with CS_D3D11ON12_DISCARD_RING=0 (for A/B).
-bool cs_DiscardRing() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_DISCARD_RING", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
+// [CS] TEMPORARILY DEFAULT-OFF (guaranteed-clean fallback while the red-flash corruption is diagnosed). With the
+// ring OFF, every rename gets a fresh always-zeroed allocation = the original layer behaviour that never corrupted
+// (~44-50fps). Re-enable (default-on) once the reuse-path corruption is fully fixed+verified. Force-on: =1.
+bool cs_DiscardRing() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_DISCARD_RING"); return v; }
 // [CS perf] DEFAULT-ON: skipping no-op upload-heap transitions in rename rotation is a proven clean +3-4fps
 // (worker-side cut, the worker gates the frame). Disable with CS_D3D11ON12_SKIPUPTRANS=0.
 bool cs_SkipUpTrans() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_SKIPUPTRANS", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
@@ -1187,14 +1190,16 @@ bool cs_SkipRedundantUsed() noexcept { static const bool v = cs_ReadEnvFlag("CS_
 bool cs_VACache() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_VACACHE"); return v; }
 // [CS perf] Eliminate m_RenamesInFlight — pass rename-backing ownership through the cookie instead of a shared
 // locked set, removing a mutex + find_if/erase on both render (create) and worker (delete). Env-gated for A/B.
-// [CS perf] Eliminate m_RenamesInFlight (cuts rename-pool lock contention on both threads, +4.7fps). Was
-// default-on, but reverted to DEFAULT-OFF while investigating an intermittent red-flash corruption report —
-// this ownership rework is the prime suspect (refcount race). Re-enable for A/B via CS_D3D11ON12_RENAMENOINFLIGHT=1.
-bool cs_RenameNoInflight() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_RENAMENOINFLIGHT"); return v; }
+// [CS perf] DEFAULT-ON: eliminate m_RenamesInFlight (cuts rename-pool lock contention on both threads, +4.7fps).
+// Was reverted during the red-flash scare but EXONERATED by the diagnosis (balanced refcount, never touches buffer
+// contents; the real cause was the ZeroCB-skip, now fixed). Disable via CS_D3D11ON12_RENAMENOINFLIGHT=0.
+bool cs_RenameNoInflight() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_RENAMENOINFLIGHT", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
 // [CS fix] DEFAULT-ON correctness fix: re-zero CBV padding on discard-ring reuse (prevents stale-padding red-flash).
 bool cs_ZeroPadOnReuse() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_ZEROPADREUSE", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
 // [CS debug] DEFAULT-OFF stress: NaN-fill retired backing padding to make the red-flash bug deterministic.
 bool cs_NanFill() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_NANFILL"); return v; }
+// [CS debug] DEFAULT-OFF: with NANFILL, poison the FULL buffer (incl data region) to test partial-writes.
+bool cs_NanFillFull() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_NANFILLFULL"); return v; }
 // [CS perf] EXACT desc composite key for the rename backing pool: size (low 40b) | bindflags (16b) |
 // heaptype (8b). Same key <=> interchangeable backing (same size+bindflags+heaptype), so a bucket is
 // desc-uniform and the FIFO front is always a valid reuse candidate (only the fence needs checking).
