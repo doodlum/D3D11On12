@@ -429,7 +429,7 @@ namespace D3D12TranslationLayer
             return m_CachedVA;
         }
         void UnderlyingResourceChanged() noexcept(false);
-        void ZeroConstantBufferPadding() noexcept;
+        void ZeroConstantBufferPadding(bool fullBuffer = false) noexcept;
         void DebugFillConstantBufferPaddingNaN() noexcept; // [CS debug] stress repro for red-flash (env-gated)
 
         UINT NumSubresources() noexcept { return AppDesc()->Subresources() * m_SubresourceMultiplier; }

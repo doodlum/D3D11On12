@@ -34,6 +34,7 @@ bool cs_RenameNoInflight() noexcept;
 bool cs_ZeroPadOnReuse() noexcept;
 bool cs_NanFill() noexcept;
 bool cs_NanFillFull() noexcept;
+bool cs_ZeroFullCB() noexcept;
 extern volatile LONG g_cs_renameReuse;
 extern volatile LONG g_cs_renameAlloc;
 bool cs_SubmitOnEventEnd() noexcept;

@@ -1183,7 +1183,9 @@ bool cs_SubmitStatsEnabled() noexcept { static const bool v = cs_ReadEnvFlag("CS
 bool cs_DiscardRing() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_DISCARD_RING"); return v; }
 // [CS perf] DEFAULT-ON: skipping no-op upload-heap transitions in rename rotation is a proven clean +3-4fps
 // (worker-side cut, the worker gates the frame). Disable with CS_D3D11ON12_SKIPUPTRANS=0.
-bool cs_SkipUpTrans() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_SKIPUPTRANS", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
+// [CS] TEMPORARILY DEFAULT-OFF too (pure-baseline build to isolate the combat-only red-flash that survives with
+// the discard-ring off). Re-enable (=1 or default-on) once the combat source is found. Barrier-skip = suspect #2.
+bool cs_SkipUpTrans() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SKIPUPTRANS"); return v; }
 // [CS perf] Collapse redundant per-subresource/re-bind Resource::UsedInCommandList repeats. Env-gated for A/B.
 bool cs_SkipRedundantUsed() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_SKIPREDUNDANTUSED"); return v; }
 // [CS perf] Cache the GPU VA to skip a per-CB-per-draw virtual COM call. Env-gated for A/B.
@@ -1200,6 +1202,9 @@ bool cs_ZeroPadOnReuse() noexcept { static const bool v = []{ char b[8] = {}; re
 bool cs_NanFill() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_NANFILL"); return v; }
 // [CS debug] DEFAULT-OFF: with NANFILL, poison the FULL buffer (incl data region) to test partial-writes.
 bool cs_NanFillFull() noexcept { static const bool v = cs_ReadEnvFlag("CS_D3D11ON12_NANFILLFULL"); return v; }
+// [CS fix] DEFAULT-ON: zero the WHOLE CB (data region + padding) on prepare, not just padding — defends against
+// Skyrim partial-writing a CB and the shader reading stale [N,Width) (suspected spell-effect red). Disable =0.
+bool cs_ZeroFullCB() noexcept { static const bool v = []{ char b[8] = {}; return !(GetEnvironmentVariableA("CS_D3D11ON12_ZEROFULLCB", b, sizeof(b)) != 0 && b[0] == '0'); }(); return v; }
 // [CS perf] EXACT desc composite key for the rename backing pool: size (low 40b) | bindflags (16b) |
 // heaptype (8b). Same key <=> interchangeable backing (same size+bindflags+heaptype), so a bucket is
 // desc-uniform and the FIFO front is always a valid reuse candidate (only the fence needs checking).
@@ -4444,7 +4449,7 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
             // (no-op unless Width % 256 != 0), so 256-aligned CBs (the common case) still pay nothing. The
             // earlier "padding stays zero, skip is safe" claim was WRONG — the suballocation is not owned.
             // Env-gate default-ON so the fix can be A/B'd against the NaN-fill repro (CS_D3D11ON12_ZEROPADREUSE=0).
-            if (cs_ZeroPadOnReuse()) reused->ZeroConstantBufferPadding();
+            if (cs_ZeroPadOnReuse()) reused->ZeroConstantBufferPadding(cs_ZeroFullCB());
             if (cs_SubmitStatsEnabled()) InterlockedIncrement(&g_cs_renameReuse);
             // [CS perf] cs_RenameNoInflight: hand the sole ref out as a raw pointer (release() keeps the ref,
             // no Release). The cookie carries it to DeleteRenameCookie which re-adopts it — skips parking it in
@@ -4461,7 +4466,7 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
 
     // TODO: See if there's a good way to cache these guys.
     unique_comptr<Resource> renameResource = Resource::CreateResource(this, creationArgsCopy, threadingContext);
-    renameResource->ZeroConstantBufferPadding();
+    renameResource->ZeroConstantBufferPadding(cs_ZeroFullCB());
 
     assert(renameResource->GetAllocatorHeapType() == AllocatorHeapType::Upload ||
         renameResource->GetAllocatorHeapType() == AllocatorHeapType::Decoder);

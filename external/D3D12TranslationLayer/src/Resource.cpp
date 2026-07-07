@@ -657,27 +657,31 @@ namespace D3D12TranslationLayer
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
-    void Resource::ZeroConstantBufferPadding() noexcept
+    void Resource::ZeroConstantBufferPadding(bool fullBuffer) noexcept
     {
-        // Determine if we need to do any work
-        if ((AppDesc()->BindFlags() & RESOURCE_BIND_CONSTANT_BUFFER) == 0 || // The only buffers that are bloated
-            AppDesc()->Width() % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0 || // Only if it's actually bloated
+        // Determine if we need to do any work. fullBuffer=true zeroes the WHOLE buffer [0, AlignedSize) (incl the
+        // data region [0,Width)) for EVERY CB — defends against Skyrim partial-writing a CB (writing only [0,N<Width))
+        // and the shader reading the unwritten [N,Width) as stale/garbage (the suspected spell-effect red-flash).
+        // fullBuffer=false is the original: only zero the bloated-CB padding [Width, AlignedSize).
+        if ((AppDesc()->BindFlags() & RESOURCE_BIND_CONSTANT_BUFFER) == 0 || // Only constant buffers
+            (!fullBuffer && AppDesc()->Width() % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0) || // padding: only if bloated
             m_Identity->m_bOwnsUnderlyingResource) // Default constant buffers are handled separately
         {
             return;
         }
 
         UINT64 AlignedSize = m_SubresourcePlacement[0].Footprint.RowPitch;
-        SIZE_T ZeroSize = static_cast<SIZE_T>(AlignedSize - AppDesc()->Width());
+        const SIZE_T startOff = fullBuffer ? 0u : static_cast<SIZE_T>(AppDesc()->Width());
+        SIZE_T ZeroSize = static_cast<SIZE_T>(AlignedSize) - startOff;
         void *pData;
         CD3DX12_RANGE ReadRange(0, 0);
         HRESULT hr = GetUnderlyingResource()->Map(0, &ReadRange, &pData);
         if (SUCCEEDED(hr))
         {
-            BYTE* pZeroAddr = reinterpret_cast<BYTE*>(pData)+m_SubresourcePlacement[0].Offset + AppDesc()->Width();
+            BYTE* pZeroAddr = reinterpret_cast<BYTE*>(pData)+m_SubresourcePlacement[0].Offset + startOff;
             ZeroMemory(pZeroAddr, ZeroSize);
 
-            CD3DX12_RANGE WrittenRange(SIZE_T(m_SubresourcePlacement[0].Offset) + AppDesc()->Width(), 0);
+            CD3DX12_RANGE WrittenRange(SIZE_T(m_SubresourcePlacement[0].Offset) + startOff, 0);
             WrittenRange.End = WrittenRange.Begin + ZeroSize;
             GetUnderlyingResource()->Unmap(0, &WrittenRange);
         }
@@ -708,7 +712,11 @@ namespace D3D12TranslationLayer
         if (SUCCEEDED(hr))
         {
             BYTE* pAddr = reinterpret_cast<BYTE*>(pData) + m_SubresourcePlacement[0].Offset + startOff;
-            for (SIZE_T i = 0; i + 4 <= FillSize; i += 4) *reinterpret_cast<UINT32*>(pAddr + i) = 0x7FC00000u;
+            // Padding-only test uses NaN (few bytes, blows out only bloated-CB objects). Full-buffer test uses a
+            // finite sentinel (50.0f) — NaN in EVERY constant causes a GPU device-removal (black screen), so 50.0
+            // corrupts VISIBLY (blown colors / displaced geometry) without crashing the driver.
+            const UINT32 sentinel = full ? 0x42480000u : 0x7FC00000u;
+            for (SIZE_T i = 0; i + 4 <= FillSize; i += 4) *reinterpret_cast<UINT32*>(pAddr + i) = sentinel;
             CD3DX12_RANGE WrittenRange(SIZE_T(m_SubresourcePlacement[0].Offset) + startOff, 0);
             WrittenRange.End = WrittenRange.Begin + FillSize;
             GetUnderlyingResource()->Unmap(0, &WrittenRange);
